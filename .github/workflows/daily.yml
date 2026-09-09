@@ -1,0 +1,79 @@
+name: A股热点资金日报
+
+# 触发方式:
+#  1) schedule : 周一至五 07:30 UTC = 北京时间 15:30 (GitHub免费机可能延迟数分钟~半小时)
+#  2) workflow_dispatch : 仓库 Actions 页手动点 "Run workflow" (首次测试/补发用)
+#  3) push : 代码推送到 main 自动试跑一次(用于验证海外机访问东方财富); 每日数据自动回写不触发(用GITHUB_TOKEN)
+on:
+  schedule:
+    - cron: '30 7 * * 1-5'
+  workflow_dispatch: {}
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write        # 允许把当日快照/历史缓存/报告 commit 回仓库(跨天积累板内上涨家数)
+
+concurrency:
+  group: a-share-daily
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 运行分析管线(自动探测休市, 节假日静默退出不生成报告)
+        run: python3 run_daily_lite.py "收盘日报"
+
+      - name: 校验今日报告是否生成
+        id: check
+        run: |
+          python3 - <<'PY'
+          import datetime, os
+          bj = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
+          today = bj.date().isoformat()
+          p = f"reports/{today}_日报.md"
+          has = os.path.exists(p)
+          if has:
+              head = open(p, encoding='utf-8').read(150)
+              if today not in head:
+                  has = False
+          print(f"today={today} report_exists={has}")
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as f:
+              f.write(f"today={today}\n")
+              f.write(f"has_report={'true' if has else 'false'}\n")
+          PY
+
+      - name: 推送到个人微信(PushPlus 全文markdown)
+        if: steps.check.outputs.has_report == 'true'
+        env:
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+        run: python3 push_wechat.py wecom_full.md "A股热点资金趋势日报"
+
+      - name: 推送企业微信(可选, 配置了WECOM_WEBHOOK才发)
+        if: steps.check.outputs.has_report == 'true'
+        env:
+          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+        run: |
+          if [ -n "$WECOM_WEBHOOK" ]; then python3 push_webhook.py; else echo "未配置 WECOM_WEBHOOK，跳过企微推送"; fi
+
+      - name: 回写当日数据(快照+历史缓存+报告, 供次日发酵度积累)
+        if: steps.check.outputs.has_report == 'true'
+        run: |
+          git config user.name "a-share-daily-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add data/ reports/ wecom_full.md wecom_summary.md
+          if ! git diff --cached --quiet; then
+            git commit -m "daily data $(date -u +%F)"
+            git push
+            echo "==> 当日数据已回写仓库"
+          else
+            echo "==> 无数据变化"
+          fi

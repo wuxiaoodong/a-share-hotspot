@@ -1,0 +1,64 @@
+name: A股放量突破选股
+
+# 触发:
+#  1) schedule : 周一至五 07:00 UTC = 北京时间 15:00 (免费机可能延迟数分钟)
+#  2) workflow_dispatch : Actions 页手动 "Run workflow" (首测/补发)
+#  3) push : 仅当筛选脚本或相关配置变动时自动试跑(路径过滤)
+on:
+  schedule:
+    - cron: '0 7 * * 1-5'
+  workflow_dispatch: {}
+  push:
+    branches: [ main ]
+    paths: [ 'screen_volume_breakout.py', 'screen.yml' ]
+
+permissions:
+  contents: write        # 允许把筛选结果(screen_result.md/CSV) commit 回仓库
+
+concurrency:
+  group: a-share-screen
+  cancel-in-progress: false
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 运行放量突破选股(自动探测交易日, 休市静默无输出)
+        run: python3 screen_volume_breakout.py
+
+      - name: 校验结果是否生成
+        id: check
+        run: |
+          if [ -s screen_result.md ]; then
+            echo "has_result=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_result=false" >> "$GITHUB_OUTPUT"
+            echo "==> 无命中 / 休市, 跳过推送"
+          fi
+
+      - name: 推送到个人微信(PushPlus)
+        if: steps.check.outputs.has_result == 'true'
+        env:
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+        run: python3 push_wechat.py screen_result.md "A股放量突破选股"
+
+      - name: 回写筛选结果(仅结果文件, [skip ci]避免自触发)
+        if: steps.check.outputs.has_result == 'true'
+        run: |
+          git config user.name "a-share-screen-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add screen_result.md screen_result_A.csv screen_result_B.csv screen_result_C.csv 2>/dev/null || true
+          if ! git diff --cached --quiet; then
+            git commit -m "screen result $(date -u +%F) [skip ci]"
+            git push
+            echo "==> 筛选结果已回写仓库"
+          else
+            echo "==> 无结果变化"
+          fi

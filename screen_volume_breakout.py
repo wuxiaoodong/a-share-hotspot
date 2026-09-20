@@ -54,34 +54,36 @@ USE_CACHE   = True
 # 初筛: 最新单日成交额 >= 此值(亿)的必非安静股直接排除(省requests).
 #  设15亿: 只排除持续活跃大票; 安静股今日放量3倍后单日额≈3亿, 不会被误杀.
 PRE_FILTER_YI = 15.0
-EM_TIMEOUT = 8       # 单请求超时(s): 快速失败, 避免卡死
-EM_RETRIES = 2       # 失败后重试次数
-THROTTLE   = 0.03    # 相邻请求间隔(s): 轻节流, 防限流又不拖慢
+EM_TIMEOUT = 6       # 单请求超时(s): 严格上限, 快速失败防卡死
+EM_RETRIES = 1       # 失败后仅重试1次即跳过(不阻塞其他股票)
+THROTTLE   = 0.06    # 相邻请求间隔(s): 全局轻节流, 防限流
+WORKERS    = 8       # 并发抓取线程数(多连接分散东财单连接限流)
 _src_order = ["em"]  # 数据源优先级(连通性自检后填充)
-_em_conn   = None    # 东财push2his持久连接(仿日报, 复用避免被重置)
 _lock = threading.Lock()
 _last_call = [0.0]
+_thread_em = threading.local()  # 每线程独立东财连接, 避免多线程共享单连接
 
 
 def _em_req(path, retries=EM_RETRIES):
-    """东财push2his 持久连接请求(仿日报 _req 写法, 运行器已验证可用)"""
-    global _em_conn
+    """东财push2his 请求: 每线程独立连接(thread-local), 避免多线程共享单连接被限流挂起"""
     for i in range(retries):
         try:
-            if _em_conn is None:
-                _em_conn = http.client.HTTPSConnection(
+            conn = getattr(_thread_em, "c", None)
+            if conn is None:
+                conn = http.client.HTTPSConnection(
                     "push2his.eastmoney.com", timeout=EM_TIMEOUT, context=TLS)
-            _em_conn.request("GET", path, headers={
+                _thread_em.c = conn
+            conn.request("GET", path, headers={
                 "User-Agent": UA,
                 "Referer": "https://data.eastmoney.com/bkzj/hy.html",
                 "Connection": "keep-alive", "Accept": "*/*"})
-            resp = _em_conn.getresponse()
+            resp = conn.getresponse()
             body = resp.read()
             if resp.status != 200:
                 raise RuntimeError(f"HTTP {resp.status}")
             return json.loads(body.decode("utf-8", "ignore"))
         except Exception:
-            _em_conn = None          # 连接异常则丢弃, 下次重建
+            _thread_em.c = None          # 连接异常则丢弃, 下次重建
             if i == retries - 1:
                 raise
             time.sleep(0.5 * (i + 1))
@@ -441,34 +443,31 @@ def main():
 
     scanned, fail = 0, 0
     t0 = time.time()
-    consec_fail = 0
+    diag = {"start": time.strftime("%H:%M:%S"), "workers": WORKERS}
+
+    def worker(item):
+        code, name = item
+        try:
+            rows = fetch_kline(code, today)
+        except Exception:
+            rows = None
+        return code, rows
 
     if todo:
-        for item in todo:
-            code, name = item
-            try:
-                rows = fetch_kline(code, today)
-            except Exception:
-                rows = None
-            scanned += 1
-            if rows is None:
-                fail += 1
-                consec_fail += 1
-                # 自适应冷却: 连续失败说明被限流, 退避越来越长
-                if consec_fail == 5:
-                    print(f"      ⚠ 连续失败{consec_fail}, 冷却30s...")
-                    time.sleep(30)
-                elif consec_fail == 15:
-                    print(f"      ⚠ 连续失败{consec_fail}, 冷却90s...")
-                    time.sleep(90)
-                elif consec_fail >= 30:
-                    print(f"      ⚠ 连续失败{consec_fail}, 冷却180s...")
-                    time.sleep(180)
-            else:
-                consec_fail = 0
-            if scanned % 200 == 0:
-                print(f"      已试 {scanned}/{len(todo)}  成功{scanned-fail}  失败{fail}  {time.time()-t0:.0f}s")
-        print(f"      本轮完成 {scanned} 只, 成功 {scanned-fail}, 失败 {fail}, 耗时 {time.time()-t0:.0f}s")
+        with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+            futs = [ex.submit(worker, it) for it in todo]
+            for fut in as_completed(futs):
+                code, rows = fut.result()
+                scanned += 1
+                if rows is None:
+                    fail += 1
+                if scanned % 200 == 0:
+                    el = time.time() - t0
+                    print(f"      已试 {scanned}/{len(todo)}  成功{scanned-fail}  失败{fail}  {el:.0f}s")
+        el = time.time() - t0
+        print(f"      本轮完成 {scanned} 只, 成功 {scanned-fail}, 失败 {fail}, 耗时 {el:.0f}s")
+        diag.update({"done": time.strftime("%H:%M:%S"), "scanned": scanned,
+                     "ok": scanned - fail, "fail": fail, "secs": round(el)})
 
     # ---- 阶段2b: 基于全部缓存做分析 ----
     recs, missing = [], 0
@@ -522,6 +521,15 @@ def main():
     with open("screen_result.md", "w", encoding="utf-8") as f:
         f.write(md)
     print(f"已写入 screen_result.md (供微信推送)")
+
+    # ---- 诊断文件(无logs权限时便于定位卡死/限流) ----
+    try:
+        with open("screen_diag.txt", "w", encoding="utf-8") as f:
+            f.write("run诊断: %s\n" % json.dumps(diag, ensure_ascii=False))
+            f.write("初筛后待扫描: %d  按最新额>=%s亿排除: %d\n" % (len(pool), PRE_FILTER_YI, prefiltered))
+            f.write("命中 A/B/C: %d/%d/%d\n" % (len(buckets["A"]), len(buckets["B"]), len(buckets["C"])))
+    except Exception:
+        pass
 
     print(f"\n口径: 基准20日(T-21~T-2)【逐日】均额<{QUIET_AMT_YI}亿 且 20日均价t的±{int((1-BAND_LO)*100)}%窄幅平台"
           f" | T与T-1放量>={VOL_MULT}x | T日涨>={PCT_UP}%")

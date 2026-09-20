@@ -22,7 +22,7 @@ concurrency:
 jobs:
   screen:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
 
@@ -49,12 +49,11 @@ jobs:
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
         run: python3 push_wechat.py screen_result.md "A股放量突破选股"
 
-      - name: 回写筛选结果(仅结果文件, [skip ci]避免自触发)
-        if: steps.check.outputs.has_result == 'true'
+      - name: 回写筛选结果(结果+诊断, [skip ci]避免自触发)
         run: |
           git config user.name "a-share-screen-bot"
           git config user.email "bot@users.noreply.github.com"
-          git add screen_result.md screen_result_A.csv screen_result_B.csv screen_result_C.csv 2>/dev/null || true
+          git add screen_result.md screen_result_A.csv screen_result_B.csv screen_result_C.csv screen_diag.txt 2>/dev/null || true
           if ! git diff --cached --quiet; then
             git commit -m "screen result $(date -u +%F) [skip ci]"
             git push

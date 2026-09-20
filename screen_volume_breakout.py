@@ -45,19 +45,49 @@ PCT_UP      = 5.0    # T日涨幅下限(%)
 BAND_HI     = 1.08   # 基准期每日最高价 < BAND_HI * t
 BAND_LO     = 0.92   # 基准期每日最低价 > BAND_LO * t
 BOTH_DAYS   = True   # True=T日与T-1日均需放量; False=仅T日
-MAX_WORKERS = 3      # 低频慢跑: 网关对高频批量会断连, 靠多轮累积缓存
 KLINE_N     = 32     # 拉取日K根数
 EXCLUDE_ST  = True
 EXCLUDE_BJ  = True
 CACHE_DIR   = os.path.join("data", "kline_cache")
 CACHE_VER   = "v2"   # 缓存版本: v2起存6字段(date,close,vol,amt,high,low)
 USE_CACHE   = True
-_gate = threading.Semaphore(MAX_WORKERS)
+# 初筛: 最新单日成交额 >= 此值(亿)的必非安静股直接排除(省requests).
+#  设15亿: 只排除持续活跃大票; 安静股今日放量3倍后单日额≈3亿, 不会被误杀.
+PRE_FILTER_YI = 15.0
+EM_TIMEOUT = 8       # 单请求超时(s): 快速失败, 避免卡死
+EM_RETRIES = 2       # 失败后重试次数
+THROTTLE   = 0.03    # 相邻请求间隔(s): 轻节流, 防限流又不拖慢
+_src_order = ["em"]  # 数据源优先级(连通性自检后填充)
+_em_conn   = None    # 东财push2his持久连接(仿日报, 复用避免被重置)
 _lock = threading.Lock()
 _last_call = [0.0]
 
 
-def _get(host, path, timeout=12, retries=3, hdr=None, raw=False):
+def _em_req(path, retries=EM_RETRIES):
+    """东财push2his 持久连接请求(仿日报 _req 写法, 运行器已验证可用)"""
+    global _em_conn
+    for i in range(retries):
+        try:
+            if _em_conn is None:
+                _em_conn = http.client.HTTPSConnection(
+                    "push2his.eastmoney.com", timeout=EM_TIMEOUT, context=TLS)
+            _em_conn.request("GET", path, headers={
+                "User-Agent": UA,
+                "Referer": "https://data.eastmoney.com/bkzj/hy.html",
+                "Connection": "keep-alive", "Accept": "*/*"})
+            resp = _em_conn.getresponse()
+            body = resp.read()
+            if resp.status != 200:
+                raise RuntimeError(f"HTTP {resp.status}")
+            return json.loads(body.decode("utf-8", "ignore"))
+        except Exception:
+            _em_conn = None          # 连接异常则丢弃, 下次重建
+            if i == retries - 1:
+                raise
+            time.sleep(0.5 * (i + 1))
+
+
+def _get(host, path, timeout=EM_TIMEOUT, retries=EM_RETRIES, hdr=None, raw=False):
     last = None
     for i in range(retries):
         try:
@@ -83,10 +113,10 @@ def tx_symbol(code):
 
 
 def _throttle():
-    """全局节流: 相邻请求之间至少间隔 250~400ms (约 3 QPS, 防封优先)"""
+    """全局轻节流: 相邻请求间隔 THROTTLE 秒(既快又不易触发限流)"""
     with _lock:
         now = time.time()
-        wait = _last_call[0] + random.uniform(0.25, 0.40) - now
+        wait = _last_call[0] + THROTTLE - now
         if wait > 0:
             time.sleep(wait)
         _last_call[0] = time.time()
@@ -161,18 +191,16 @@ def _kline_tx(code):
 
 
 def _kline_em(code):
-    """东财 push2his 个股日K(运行器IP可用; 沙箱IP被封) -> [(date,close,vol手,amt元,high,low)]"""
+    """东财 push2his 个股日K(持久连接, 运行器可用) -> [(date,close,vol手,amt元,high,low)]"""
     _throttle()
     mkt = "1" if code.startswith(("60", "68", "9", "5")) else "0"
     secid = f"{mkt}.{code}"
-    d = _get("push2his.eastmoney.com", "/api/qt/stock/kline/get?" + urllib.parse.urlencode({
+    d = _em_req("/api/qt/stock/kline/get?" + urllib.parse.urlencode({
         "secid": secid, "ut": "fa5fd1943c7b386f172d6893dbfba10b",
         "fields1": "f1,f2,f3,f4,f5,f6",
         "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
         "klt": "101", "fqt": "1", "lmt": KLINE_N, "end": "20500101",
-    }), timeout=12, retries=2, hdr={
-        "User-Agent": UA, "Referer": "https://data.eastmoney.com/bkzj/hy.html",
-        "Connection": "keep-alive", "Accept": "*/*"})
+    }))
     kl = ((d.get("data") or {}).get("klines")) or []
     rows = []
     for s in kl:
@@ -180,11 +208,13 @@ def _kline_em(code):
         if len(p) < 7:
             continue
         try:
-            cl, vol, amt = float(p[2]), float(p[5]), float(p[6])   # 额=元(真实成交)
+            cl, vol, amt = float(p[2]), float(p[5]), float(p[6])   # p[6]=真实成交额(元)
             hi, lo = float(p[3]), float(p[4])
             rows.append((p[0], cl, vol, amt, hi, lo))
         except Exception:
             continue
+    if not rows:
+        raise RuntimeError("em empty")
     return rows
 
 
@@ -204,8 +234,50 @@ def load_cache(code, today):
         return None
 
 
+def _self_check():
+    """运行器连通性自检: 确定可用数据源优先级; 全不可用则静默退出(防卡死)"""
+    global _src_order
+    tests = ["600000", "000001", "300750"]
+    em_ok = 0
+    for c in tests:
+        try:
+            if _kline_em(c):
+                em_ok += 1
+        except Exception:
+            pass
+    if em_ok >= 1:
+        _src_order = ["em", "sina", "tx"]
+        print(f"      自检: 东财可用(命中{em_ok}/{len(tests)}), 优先东财")
+        return True
+    sina_ok = tx_ok = 0
+    for c in tests:
+        try:
+            if _kline_sina(c):
+                sina_ok += 1
+        except Exception:
+            pass
+        try:
+            if _kline_tx(c):
+                tx_ok += 1
+        except Exception:
+            pass
+    order = []
+    if sina_ok >= 1:
+        order.append("sina")
+    if tx_ok >= 1:
+        order.append("tx")
+    if em_ok >= 1:
+        order.append("em")
+    if not order:
+        print("      ⚠ 所有数据源在运行器均不可用, 静默退出(无结果/不推送)")
+        return False
+    _src_order = order
+    print(f"      自检: 东财不可用, 改用 {order} (sina={sina_ok}, tx={tx_ok})")
+    return True
+
+
 def fetch_kline(code, today=None):
-    """带本地缓存的日K获取: 新浪优先, 失败回落腾讯"""
+    """带本地缓存的日K获取: 按连通性自检确定的源顺序回落"""
     today = today or beijing_today()
     cp = cache_path(code, today)
     if USE_CACHE and os.path.exists(cp):
@@ -215,9 +287,10 @@ def fetch_kline(code, today=None):
         except Exception:
             pass
     rows = None
-    for fn in (_kline_em, _kline_sina, _kline_tx):
+    fns = {"em": _kline_em, "sina": _kline_sina, "tx": _kline_tx}
+    for key in _src_order:
         try:
-            r = fn(code)
+            r = fns[key](code)
             if r:
                 rows = r
                 break
@@ -332,6 +405,9 @@ def build_markdown(today, buckets, prefiltered, scanned):
 
 def main():
     today = beijing_today()
+    print(f"[0/3] 运行器数据源连通性自检 ...")
+    if not _self_check():
+        sys.exit(0)          # 数据源全不可用: 静默退出, 不推送空结果(防GitHub Actions卡死)
     print(f"[1/3] 拉全市场A股清单 (今日={today}, T=最近完整交易日)")
     uni = fetch_universe()
     pool, prefiltered = [], 0

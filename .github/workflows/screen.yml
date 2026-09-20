@@ -1,12 +1,12 @@
 name: A股放量突破选股
 
 # 触发:
-#  1) schedule : 周一至五 07:00 UTC = 北京时间 15:00 (免费机可能延迟数分钟)
+#  1) schedule : 周一至五 07:30 UTC = 北京时间 15:30 (与热点资金日报一致; 免费机可能延迟数分钟)
 #  2) workflow_dispatch : Actions 页手动 "Run workflow" (首测/补发)
 #  3) push : 仅当筛选脚本或相关配置变动时自动试跑(路径过滤)
 on:
   schedule:
-    - cron: '0 7 * * 1-5'
+    - cron: '30 7 * * 1-5'
   workflow_dispatch: {}
   push:
     branches: [ main ]

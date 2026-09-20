@@ -58,7 +58,8 @@ EM_TIMEOUT = 6       # 单请求超时(s): 严格上限, 快速失败防卡死
 EM_RETRIES = 1       # 失败后仅重试1次即跳过(不阻塞其他股票)
 THROTTLE   = 0.06    # 相邻请求间隔(s): 全局轻节流, 防限流
 WORKERS    = 8       # 并发抓取线程数(多连接分散东财单连接限流)
-_src_order = ["em"]  # 数据源优先级(连通性自检后填充)
+_src_order = ["sina", "tx"]  # 数据源优先级(连通性自检后填充; 东财push2his逐只k线已失效, 默认新浪/腾讯)
+_src_scale = {"em": 1.0, "sina": 1.0, "tx": 1.0}  # amt单位校准系数(自检时按东财f6基准自动确定)
 _lock = threading.Lock()
 _last_call = [0.0]
 _thread_em = threading.local()  # 每线程独立东财连接, 避免多线程共享单连接
@@ -236,45 +237,61 @@ def load_cache(code, today):
         return None
 
 
+def _em_f6_map(codes):
+    """用东财实时行情接口(push2)取测试股最新一日成交额(元), 作amt单位校准基准; 失败返回{}"""
+    m = {}
+    for c in codes:
+        mkt = "1" if c.startswith(("60", "68", "9", "5")) else "0"
+        try:
+            d = _get("push2.eastmoney.com",
+                     "/api/qt/stock/get?" + urllib.parse.urlencode(
+                         {"secid": f"{mkt}.{c}", "fields": "f6",
+                          "ut": "fa5fd1943c7b386f172d6893dbfba10b"}),
+                     timeout=8, retries=1,
+                     hdr={"User-Agent": UA, "Referer": "https://quote.eastmoney.com/"})
+            f6 = (d.get("data") or {}).get("f6")
+            if f6:
+                m[c] = float(f6)
+        except Exception:
+            pass
+    return m
+
+
 def _self_check():
-    """运行器连通性自检: 确定可用数据源优先级; 全不可用则静默退出(防卡死)"""
-    global _src_order
+    """运行器连通性自检: 确定可用数据源顺序, 并按东财f6基准自动校准amt单位(防手/股换算错位)"""
+    global _src_order, _src_scale
     tests = ["600000", "000001", "300750"]
-    em_ok = 0
-    for c in tests:
-        try:
-            if _kline_em(c):
-                em_ok += 1
-        except Exception:
-            pass
-    if em_ok >= 1:
-        _src_order = ["em", "sina", "tx"]
-        print(f"      自检: 东财可用(命中{em_ok}/{len(tests)}), 优先东财")
-        return True
-    sina_ok = tx_ok = 0
-    for c in tests:
-        try:
-            if _kline_sina(c):
-                sina_ok += 1
-        except Exception:
-            pass
-        try:
-            if _kline_tx(c):
-                tx_ok += 1
-        except Exception:
-            pass
+    f6map = _em_f6_map(tests)
     order = []
-    if sina_ok >= 1:
-        order.append("sina")
-    if tx_ok >= 1:
-        order.append("tx")
-    if em_ok >= 1:
-        order.append("em")
+    for key, fn in [("sina", _kline_sina), ("tx", _kline_tx), ("em", _kline_em)]:
+        try:
+            probe = fn(tests[0])
+        except Exception:
+            probe = None
+        if not probe:
+            print(f"      自检: {key} 不可用, 跳过")
+            continue
+        order.append(key)
+        if f6map:
+            ratios = []
+            for c in tests:
+                try:
+                    r = fn(c)
+                    if r and c in f6map and float(r[-1][3]) > 0:
+                        ratios.append(f6map[c] / float(r[-1][3]))
+                except Exception:
+                    pass
+            if ratios:
+                med = sorted(ratios)[len(ratios) // 2]
+                _src_scale[key] = 1.0 if 0.3 <= med <= 3 else max(0.01, min(100.0, med))
+                print(f"      自检: {key} 可用, amt校准系数={_src_scale[key]:.3f}")
+                continue
+        print(f"      自检: {key} 可用 (无f6基准, 默认系数1.0)")
     if not order:
         print("      ⚠ 所有数据源在运行器均不可用, 静默退出(无结果/不推送)")
         return False
     _src_order = order
-    print(f"      自检: 东财不可用, 改用 {order} (sina={sina_ok}, tx={tx_ok})")
+    print(f"      自检完成: 源顺序={order}, 校准={_src_scale}")
     return True
 
 
@@ -294,6 +311,9 @@ def fetch_kline(code, today=None):
         try:
             r = fns[key](code)
             if r:
+                sc = _src_scale.get(key, 1.0)
+                if sc != 1.0:
+                    r = [(x[0], x[1], x[2], x[3] * sc, x[4], x[5]) for x in r]
                 rows = r
                 break
         except Exception:

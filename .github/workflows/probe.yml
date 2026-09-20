@@ -1,0 +1,35 @@
+name: A股选股数据源探针
+on:
+  push:
+    paths:
+      - 'probe_kline.py'
+      - '.github/workflows/probe.yml'
+concurrency:
+  group: a-share-probe
+  cancel-in-progress: false
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 运行探针(实测三数据源逐只日K抓取耗时/成功率)
+        run: python probe_kline.py
+      - name: 回写探针结果([skip ci]避免触发其他workflow)
+        if: always()
+        run: |
+          git config user.name "a-share-screen-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add probe_result.txt 2>/dev/null || true
+          if ! git diff --cached --quiet; then
+            git commit -m "probe result $(date -u +%F-%H%M) [skip ci]"
+            git push
+            echo "==> 探针结果已回写"
+          else
+            echo "==> 无probe结果"
+          fi

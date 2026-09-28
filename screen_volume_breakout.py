@@ -126,23 +126,50 @@ def _throttle():
 
 
 def fetch_universe():
-    """东财 clist 拉全市场A股代码+名称+最新单日成交额(push2delay 网关, 未限流)"""
-    fs = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
-    out, pn = [], 1
-    while True:
-        d = _get("push2delay.eastmoney.com", "/api/qt/clist/get?" + urllib.parse.urlencode({
-            "pn": pn, "pz": 100, "po": 1, "np": 1, "fltt": 2, "invt": 2,
-            "fid": "f12", "fs": fs, "fields": "f12,f14,f6",
-        }), hdr={"User-Agent": UA, "Referer": "https://quote.eastmoney.com/"})
-        data = d.get("data") or {}
-        diff = data.get("diff") or []
-        if not diff:
-            break
-        out.extend(diff)
-        if len(out) >= int(data.get("total") or 0) or pn > 60:
-            break
-        pn += 1
-    return out
+    """全市场A股清单: 优先读本地静态清单 data/universe.csv(由 gen_universe.py 生成, 不依赖东财);
+    若缺失则回退东财 clist(东财封禁时可能为空/失败). 返回 [{f12:code, f14:name, f6:amt元}]"""
+    csv_path = os.path.join("data", "universe.csv")
+    if os.path.exists(csv_path):
+        try:
+            import csv as _csv
+            out = []
+            with open(csv_path, encoding="utf-8-sig", newline="") as f:
+                for row in _csv.DictReader(f):
+                    code = (row.get("code") or "").strip()
+                    name = (row.get("name") or "").strip()
+                    if not code:
+                        continue
+                    try:
+                        amt = float(row.get("f6") or 0)
+                    except Exception:
+                        amt = 0.0
+                    out.append({"f12": code, "f14": name, "f6": amt})
+            if out:
+                print(f"      从本地清单载入 {len(out)} 只 (data/universe.csv)")
+                return out
+        except Exception as e:
+            print(f"      ⚠ 读本地清单失败: {e}, 尝试东财clist")
+    # 回退: 东财 clist (东财封禁时通常返回空/断连)
+    try:
+        fs = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
+        out, pn = [], 1
+        while True:
+            d = _get("push2delay.eastmoney.com", "/api/qt/clist/get?" + urllib.parse.urlencode({
+                "pn": pn, "pz": 100, "po": 1, "np": 1, "fltt": 2, "invt": 2,
+                "fid": "f12", "fs": fs, "fields": "f12,f14,f6",
+            }), hdr={"User-Agent": UA, "Referer": "https://quote.eastmoney.com/"})
+            data = d.get("data") or {}
+            diff = data.get("diff") or []
+            if not diff:
+                break
+            out.extend(diff)
+            if len(out) >= int(data.get("total") or 0) or pn > 60:
+                break
+            pn += 1
+        return out
+    except Exception as e:
+        print(f"      ⚠ 东财clist回退也失败: {e}")
+        return []
 
 
 def _kline_sina(code):
@@ -336,15 +363,22 @@ def beijing_today():
 
 
 def analyze(code, name, rows, today):
-    """只做口径计算, 不做过滤; 返回 None 表示数据不足或基准额不达标"""
-    if rows and rows[-1][0] == today:      # 剔除盘中未收盘的当日K线
-        rows = rows[:-1]
+    """只做口径计算, 不做过滤; 返回 None 表示数据不足或基准额不达标。
+    注: 定时任务在收盘后(15:30)运行, 当日K线已收盘, 故保留当日(不剔除)。"""
     if len(rows) < 22:
         return None
 
     t, t1 = rows[-1], rows[-2]
     base = rows[-22:-2]                     # T-21 ~ T-2 共20根
     if len(base) != 20:
+        return None
+
+    # 数据新鲜度: 基准期最后一日须是近期(<=45天), 否则为陈旧/异常缓存(如多年前的历史K线), 直接剔除防误判
+    try:
+        _bt = datetime.date.fromisoformat(base[-1][0])
+        if (datetime.date.today() - _bt).days > 45:
+            return None
+    except Exception:
         return None
 
     base_avg = sum(r[3] for r in base) / 20.0
@@ -404,8 +438,8 @@ def build_markdown(today, buckets, prefiltered, scanned):
     L = []
     L.append(f"# 📊 A股放量突破选股 · {today}")
     L.append("")
-    L.append(f"**筛选口径**：前20个交易日（T-21~T-2）【逐日】成交额 < {QUIET_AMT_YI}亿，"
-             f"且20日均价t处于 ±{int((1-BAND_LO)*100)}% 窄幅平台；"
+    L.append(    f"**筛选口径**：前20个交易日（T-21~T-2）【逐日】成交额 < {QUIET_AMT_YI}亿，"
+             f"且20日均价t处于 ±{int(round((1-BAND_LO)*100))}% 窄幅平台；"
              f"T与T-1日放量 ≥ {VOL_MULT}x；T日涨幅 ≥ {PCT_UP}%。")
     L.append(f"（已初筛排除最新单日成交额≥{PRE_FILTER_YI}亿的 {prefiltered} 只，进入扫描 {scanned} 只）")
     L.append("")
@@ -557,7 +591,7 @@ def main():
     except Exception:
         pass
 
-    print(f"\n口径: 基准20日(T-21~T-2)【逐日】均额<{QUIET_AMT_YI}亿 且 20日均价t的±{int((1-BAND_LO)*100)}%窄幅平台"
+    print(f"\n口径: 基准20日(T-21~T-2)【逐日】均额<{QUIET_AMT_YI}亿 且 20日均价t的±{int(round((1-BAND_LO)*100))}%窄幅平台"
           f" | T与T-1放量>={VOL_MULT}x | T日涨>={PCT_UP}%")
 
 

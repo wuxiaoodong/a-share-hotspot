@@ -124,11 +124,106 @@ def fetch_boards(fs):
 
 
 def fetch_sector_stocks(bk_code):
-    d = http_get_json({
-        "pn": 1, "pz": 50, "po": 1, "np": 1, "fltt": 2, "invt": 2,
-        "fid": "f62", "fs": f"b:{bk_code}", "fields": STOCK_FIELDS,
-    })
-    return (d.get("data") or {}).get("diff") or []
+    # 东财 clist 已封禁, 个股深挖暂不可用, 返回空(下游会跳过该板块个股表)
+    return []
+
+
+def fetch_today_flow(code, asof):
+    """从 push2his 资金流最新一根K线取今日主力净额(亿)与涨跌幅%(东财clist封禁, 仅fflow可用)"""
+    try:
+        d = http_get_json_his({
+            "secid": f"90.{code}", "lmt": 2, "klt": 101,
+            "fields1": "f1,f2,f3,f7",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
+        })
+        kl = ((d.get("data") or {}).get("klines")) or []
+        if not kl:
+            return None, None
+        last = kl[-1].split(",")
+        if len(last) < 13:
+            return None, None
+        main = float(last[1]) / 1e8
+        pct = float(last[12]) if len(last) > 12 else 0.0
+        return main, pct
+    except Exception:
+        return None, None
+
+
+def load_board_list():
+    """静态板块清单(东财clist封禁后的兜底): 优先 data/boards.csv, 否则扫描 fund_history 缓存"""
+    import csv as _csv
+    csv_path = os.path.join("data", "boards.csv")
+    out = []
+    if os.path.exists(csv_path):
+        with open(csv_path, encoding="utf-8-sig", newline="") as f:
+            for r in _csv.DictReader(f):
+                c = (r.get("code") or "").strip()
+                n = (r.get("name") or "").strip()
+                t = (r.get("type") or "行业").strip()
+                if c:
+                    out.append((c, n, t))
+    if out:
+        return out
+    for fp in sorted(glob.glob(os.path.join("data", "fund_history", "*.json"))):
+        try:
+            d = json.load(open(fp, encoding="utf-8"))
+            data = d.get("data") or {}
+            c, n = data.get("code"), data.get("name")
+            if c and n:
+                out.append((c, n, "行业"))
+        except Exception:
+            pass
+    return out
+
+
+def build_board_from_fflow(code, name, btype, asof):
+    """用 push2his 资金流历史(不含今日)+ 今日资金流, 重建板块指标(东财clist封禁替代方案)"""
+    hist, src = load_fund_history(code, asof)   # [(date,main_yi,pct)] 不含今日
+    t_main, t_pct = fetch_today_flow(code, asof)
+    if t_main is None:
+        t_main = hist[-1][1] if hist else 0.0
+    if t_pct is None:
+        t_pct = hist[-1][2] if hist else 0.0
+    if not hist and t_main == 0.0:
+        return None
+    series = list(hist) + [(asof, t_main, t_pct)]
+    fund_streak = 0
+    for _, m, _ in reversed(series):
+        if m > 0:
+            fund_streak += 1
+        else:
+            break
+    up_streak = 0
+    for _, _, p in reversed(series):
+        if p > 0:
+            up_streak += 1
+        else:
+            break
+    net_sum = sum(m for _, m, _ in series)
+    cum3 = sum(m for _, m, _ in series[-3:])
+    cum5 = sum(m for _, m, _ in series[-5:])
+    cum10 = sum(m for _, m, _ in series[-10:])
+    segs = [m for _, m, _ in series[-4:]]
+    while len(segs) < 4:
+        segs = [0.0] + segs
+    r5 = sum(p for _, _, p in series[-5:])
+    ratio = (t_main / (abs(t_main) + 0.01)) * 5.0  # 净占比代理(缺成交额字段)
+    # 板内涨跌代理: 资金流接口无个股明细, 以近6日板块涨幅符号近似涨跌家数占比
+    recent = series[-6:]
+    up = sum(1 for _, _, p in recent if p > 0)
+    down = sum(1 for _, _, p in recent if p < 0)
+    tot = up + down
+    diffusion = (up / tot) if tot > 0 else 0.5
+    return {
+        "id": code, "name": name, "type": btype,
+        "pct": t_pct, "turnover_yi": 0.0, "main_yi": t_main,
+        "up": up, "down": down, "lead": "-", "r5": r5,
+        "segs": segs, "cum3_yi": cum3, "cum5_yi": cum5, "cum10_yi": cum10,
+        "ratio": ratio, "diffusion": diffusion, "streak": fund_streak,
+        "_asof": asof, "hist_src": src, "series": series,
+        "fund_streak_d": fund_streak, "up_streak_d": up_streak,
+        "net_sum_yi": net_sum,
+    }
 
 
 def parse_fflow_klines(d, asof):
@@ -378,24 +473,23 @@ def main():
         return
     print("    今日为交易日 ✓")
 
-    print("==> 1/5 拉取行业/概念板块资金数据 ...")
-    ind_rows = fetch_boards("m:90+t:2")
-    time.sleep(1.0)
-    con_rows = fetch_boards("m:90+t:3")
-    print(f"    行业 {len(ind_rows)} 个, 概念 {len(con_rows)} 个")
+    print("==> 1/5 拉取行业/概念板块资金数据(静态清单 + push2his 资金流) ...")
+    board_list = load_board_list()
+    print(f"    静态板块清单 {len(board_list)} 个(东财 clist 已封, 改用 boards.csv + push2his 资金流)")
 
-    def safe_board(r, t):
+    def safe_build(code, name, t):
         try:
-            return build_board(r, t)
+            b = build_board_from_fflow(code, name, t, asof)
+            if b is None:
+                return None
+            b["_asof"] = asof
+            return b
         except Exception as e:
-            print(f"    ⚠ build_board异常(skip): {e}")
+            print(f"    ⚠ build_board_from_fflow异常(skip {name}): {e}")
             return None
-    pool = [b for b in (safe_board(r, "行业") for r in ind_rows) if b] + \
-           [b for b in (safe_board(r, "概念") for r in con_rows) if b]
-    for b in pool:
-        b["_asof"] = asof
-    pool = [b for b in pool if b["turnover_yi"] >= MIN_TURNOVER_YI]
-    print(f"    过滤低成交板块后 {len(pool)} 个")
+    # 东财 clist 封禁后改用静态清单 + 资金流重建; 无资金流数据的板块(返回None)自动剔除
+    pool = [b for b in (safe_build(c, n, t) for (c, n, t) in board_list) if b]
+    print(f"    重建资金指标后 {len(pool)} 个板块")
 
     print("==> 2/5 计算 HotScore / 生命周期 / 潜在新热点 ...")
     v_main = [b["main_yi"] for b in pool]

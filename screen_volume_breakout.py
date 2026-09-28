@@ -490,13 +490,19 @@ def main():
                      "ok": scanned - fail, "fail": fail, "secs": round(el)})
 
     # ---- 阶段2b: 基于全部缓存做分析 ----
-    recs, missing = [], 0
+    recs, missing, errs = [], 0, 0
     for code, name in pool:
         rows = load_cache(code, today)
         if rows is None:
             missing += 1
             continue
-        r = analyze(code, name, rows, today)
+        try:
+            r = analyze(code, name, rows, today)
+        except Exception as e:
+            errs += 1
+            if errs <= 5:
+                print(f"      ⚠ analyze异常 {code} {name}: {e}")
+            continue
         if r:
             recs.append(r)
     print(f"      缓存覆盖 {len(pool)-missing}/{len(pool)} 只 (缺 {missing})")
@@ -556,4 +562,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        import traceback
+        with open("screen_error.txt", "w", encoding="utf-8") as f:
+            f.write("screen run crashed:\n" + traceback.format_exc())
+        raise

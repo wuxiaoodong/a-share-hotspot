@@ -64,14 +64,14 @@ jobs:
         run: |
           if [ -n "$WECOM_WEBHOOK" ]; then python3 push_webhook.py; else echo "未配置 WECOM_WEBHOOK，跳过企微推送"; fi
 
-      - name: 回写当日数据(快照+历史缓存+报告, 供次日发酵度积累)
-        if: steps.check.outputs.has_report == 'true'
+      - name: 回写当日数据(快照+历史缓存+报告+诊断, [skip ci]防自触发)
+        if: always()
         run: |
           git config user.name "a-share-daily-bot"
           git config user.email "bot@users.noreply.github.com"
-          git add data/ reports/ wecom_full.md wecom_summary.md
+          git add data/ reports/ wecom_full.md wecom_summary.md daily_error.txt screen_error.txt screen_diag.txt 2>/dev/null || true
           if ! git diff --cached --quiet; then
-            git commit -m "daily data $(date -u +%F)"
+            git commit -m "daily data $(date -u +%F) [skip ci]"
             git push
             echo "==> 当日数据已回写仓库"
           else

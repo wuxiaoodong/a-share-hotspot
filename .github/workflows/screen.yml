@@ -50,10 +50,11 @@ jobs:
         run: python3 push_wechat.py screen_result.md "A股放量突破选股"
 
       - name: 回写筛选结果(结果+诊断, [skip ci]避免自触发)
+        if: always()
         run: |
           git config user.name "a-share-screen-bot"
           git config user.email "bot@users.noreply.github.com"
-          git add screen_result.md screen_result_A.csv screen_result_B.csv screen_result_C.csv screen_diag.txt 2>/dev/null || true
+          git add screen_result.md screen_result_A.csv screen_result_B.csv screen_result_C.csv screen_diag.txt daily_error.txt screen_error.txt 2>/dev/null || true
           if ! git diff --cached --quiet; then
             git commit -m "screen result $(date -u +%F) [skip ci]"
             git push

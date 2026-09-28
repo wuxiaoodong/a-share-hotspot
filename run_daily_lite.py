@@ -384,8 +384,14 @@ def main():
     con_rows = fetch_boards("m:90+t:3")
     print(f"    行业 {len(ind_rows)} 个, 概念 {len(con_rows)} 个")
 
-    pool = [build_board(r, "行业") for r in ind_rows] + \
-           [build_board(r, "概念") for r in con_rows]
+    def safe_board(r, t):
+        try:
+            return build_board(r, t)
+        except Exception as e:
+            print(f"    ⚠ build_board异常(skip): {e}")
+            return None
+    pool = [b for b in (safe_board(r, "行业") for r in ind_rows) if b] + \
+           [b for b in (safe_board(r, "概念") for r in con_rows) if b]
     for b in pool:
         b["_asof"] = asof
     pool = [b for b in pool if b["turnover_yi"] >= MIN_TURNOVER_YI]
@@ -696,4 +702,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        import traceback
+        with open("daily_error.txt", "w", encoding="utf-8") as f:
+            f.write("daily run crashed:\n" + traceback.format_exc())
+        raise
